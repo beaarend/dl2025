@@ -260,7 +260,7 @@ def generate_heatmap(records, img_h=28, img_w=28):
 def get_max_levels(height, width):
     return int(math.floor(math.log2(min(height, width))))
 
-def generate_zero_zone_analysis(model, dataset, run_dir, max_level=2):
+def generate_zero_zone_analysis(model, dataset, run_dir, max_level=1000):
     model.eval()
     records = []
 
