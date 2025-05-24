@@ -9,9 +9,9 @@ from pathlib import Path # <- Importar Path
 def main():
     parser = argparse.ArgumentParser(description="Executa análise XAI (Zero Zones ou GradCAM).") # Adicionar descrição
     # Adicionando a opção para carregar um modelo específico do PyTorch
-    parser.add_argument('--model_name', type=str, required=True, # Tornar obrigatório
-                        choices=['resnet18', 'mobilenet_v2'],
-                        help='Nome do modelo a ser usado.')
+    parser.add_argument('--model_name', type=str, required=True,
+                        choices=['resnet18', 'mobilenet_v2', 'vgg16', 'efficientnet_b0'], # Adicionados
+                        help='Nome do modelo SOTA a ser usado.')
     parser.add_argument('--heatmap_type', type=str, required=True, # Tornar obrigatório
                         choices=['gradcam', 'zero_zone'],
                         help='Tipo de heatmap a ser criado.')
@@ -25,6 +25,8 @@ def main():
                         help='Nível máximo de recursão para Zero Zones.')
     parser.add_argument('--num_images', type=int, default=10,
                         help='Número de imagens por classe para analisar.')
+    parser.add_argument('--use_pretrained', type=lambda x: (str(x).lower() == 'true'), default=True,
+                    help='Usar pesos pré-treinados do ImageNet se nenhum modelo fine-tunado existir (True/False). Default: True')
 
     args = parser.parse_args()
     
@@ -50,23 +52,30 @@ def main():
         print(f"Erro ao salvar config.yaml: {e}")
     # ------------------------------------
 
+    # Carregar o dataset de TESTE para a análise XAI
     print("Carregando dataset de TESTE para análise XAI...")
-    dataset, data_loader = ut.load_dataset(args.dataset_name, train=False) 
+    # A função load_dataset não precisa mais do model_name_hint, pois get_transforms foi simplificada
+    dataset_test, data_loader_test = ut.load_dataset(args.dataset_name, train=False)
 
     # Carregar o modelo
-    model = ut.load_model(args.model_name, args.dataset_name)
+    model = ut.load_model(args.model_name, args.dataset_name, use_imagenet_pretrained=args.use_pretrained)
+
 
     print("Avaliando o modelo carregado/treinado no dataset de teste...")
-    # Precisa carregar o test loader com o hint correto!
-    _, test_loader_for_eval = ut.load_dataset(args.dataset_name, train=False)
-    accuracy = ut.eval_model(model, test_loader_for_eval)
-    print(f"!!! Acurácia do Modelo Carregado: {accuracy:.4f} !!!")
-    if accuracy < 0.50: # Se a acurácia for muito baixa, algo está errado
-        print("!!! ATENÇÃO: Acurácia muito baixa. O modelo pode estar quebrado. Verifique o fine-tuning. !!!")
+    accuracy = ut.eval_model(model, data_loader_test) # Usa o data_loader_test
+    print(f"!!! Acurácia do Modelo Carregado/Fine-tunado: {accuracy:.4f} !!!")
+    if accuracy < 0.20 and args.dataset_name != 'imagenet': # Ajuste o limiar conforme o dataset
+        print("!!! ATENÇÃO: Acurácia muito baixa. O modelo pode não ter treinado corretamente. !!!")
+    
+    # ... (resto do main, chamando generate_zero_zone_analysis com dataset_test) ...
+    if args.heatmap_type == 'zero_zone':
+        hm.generate_zero_zone_analysis(model, dataset_test, run_dir, 
+                                       num_images_per_class=args.num_images, 
+                                       max_level=args.max_level)
 
     # Criar o heatmap
     if args.heatmap_type == 'zero_zone':
-        hm.generate_zero_zone_analysis(model, dataset, run_dir, 
+        hm.generate_zero_zone_analysis(model, dataset_test, run_dir, 
                                        num_images_per_class=args.num_images)
     elif args.heatmap_type == 'gradcam':
         print("GradCAM ainda não implementado.")

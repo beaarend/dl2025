@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
 import time
+import os # Adicionado para checar se o arquivo existe em perform_fine_tuning
 
 # --- Configurações Gerais ---
 MODELS_DIR = Path("models")
@@ -21,7 +22,6 @@ def get_model_input_channels(model: nn.Module) -> int:
     for layer in model.modules():
         if isinstance(layer, nn.Conv2d):
             return layer.in_channels
-    # Se não encontrar Conv2d (improvável para SOTA), assume 3.
     print("AVISO: Nenhuma camada Conv2d encontrada. Assumindo 3 canais de entrada.")
     return 3
 
@@ -51,7 +51,7 @@ def get_transforms(target_size: int = 224):
 
 def load_dataset(dataset_name: str, train: bool, batch_size: int = 64):
     """Carrega dataset de treino OU teste com transformações padrão SOTA."""
-    transform = get_transforms() # Sempre usa as transformações padrão (224x224, 3ch)
+    transform = get_transforms() 
 
     print(f"Carregando dataset '{dataset_name}' (Train={train}) com transformações padrão SOTA...")
 
@@ -92,7 +92,7 @@ def train_one_epoch(model, loader, optimizer, criterion):
         correct += (preds == labels).sum().item()
         total += labels.size(0)
         
-        if (i + 1) % 50 == 0:
+        if (i + 1) % 50 == 0 or (i+1) == len(loader): # Log no último batch também
             print(f"  Batch {i+1}/{len(loader)}, Loss: {loss.item():.4f}")
 
     epoch_time = time.time() - start_time
@@ -111,17 +111,23 @@ def eval_model(model, loader):
             total += labels.size(0)
     return correct/total
 
-def perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=3): # Aumentei epochs para 3
+def perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=3, initial_lr=0.0001):
     """Realiza o fine-tuning do modelo e o salva."""
-    print(f"--- Iniciando Fine-Tuning: {model_name} em {dataset_name} ({epochs} epochs) ---")
+    print(f"--- Iniciando Fine-Tuning: {model_name} em {dataset_name} ({epochs} epochs, LR inicial: {initial_lr}) ---")
     model.to(DEVICE)
 
-    train_dataset, train_loader = load_dataset(dataset_name, train=True, batch_size=32)
-    test_dataset, test_loader = load_dataset(dataset_name, train=False, batch_size=32)
+    # Ajustar batch_size para fine-tuning se necessário (pode ser menor para modelos maiores)
+    ft_batch_size = 32 
+    train_dataset, train_loader = load_dataset(dataset_name, train=True, batch_size=ft_batch_size)
+    test_dataset, test_loader = load_dataset(dataset_name, train=False, batch_size=ft_batch_size)
 
-    optimizer = optim.Adam(model.parameters(), lr=0.0001) # Reduzi LR para fine-tuning
+    optimizer = optim.Adam(model.parameters(), lr=initial_lr) 
     criterion = nn.CrossEntropyLoss()
+    # Opcional: Adicionar um scheduler para a taxa de aprendizado
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+
     best_acc = 0.0
+    model_saved_in_epoch = False
 
     for ep in range(1, epochs + 1):
         start_ep_time = time.time()
@@ -132,25 +138,40 @@ def perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=3): 
         
         print(f"  Epoch {ep} - Loss: {loss:.4f}, Train Acc: {acc_tr:.4f}, Test Acc: {acc_te:.4f} "
               f"| Train Time: {train_time:.1f}s, Total Time: {end_ep_time - start_ep_time:.1f}s")
+        
+        # if scheduler: scheduler.step() # Para usar o scheduler
 
         if acc_te > best_acc:
             best_acc = acc_te
             print(f"  -> Nova melhor acurácia ({best_acc:.4f})! Salvando modelo em {model_path}...")
             torch.save(model.state_dict(), model_path)
+            model_saved_in_epoch = True
+        elif ep == epochs and not model_saved_in_epoch: # Salva na última época se não melhorou antes
+            print(f"  -> Fine-tuning finalizado. Salvando modelo da última época em {model_path} (Acc Teste: {acc_te:.4f})...")
+            torch.save(model.state_dict(), model_path)
 
-    print(f"--- Fine-Tuning Concluído. Melhor Acurácia: {best_acc:.4f} ---")
+
+    print(f"--- Fine-Tuning Concluído. Melhor Acurácia Registrada: {best_acc:.4f} ---")
     
+    # Carrega o estado do modelo que foi salvo (o melhor ou o último)
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     else:
-        print("AVISO: O modelo fine-tunado não foi salvo (nenhuma melhoria?). Usando a última versão.")
+        print(f"AVISO: O arquivo do modelo {model_path} não foi encontrado após o fine-tuning. Usando o modelo em memória.")
 
     return model
 
 # --- Carregamento de Modelo ---
 
-def load_model(model_name: str, dataset_name: str):
-    """Carrega um modelo SOTA PyTorch, fine-tunando se necessário."""
+def load_model(model_name: str, dataset_name: str, use_imagenet_pretrained: bool = True):
+    """
+    Carrega um modelo SOTA PyTorch.
+    - Se um modelo fine-tunado localmente existir, ele é carregado.
+    - Senão:
+        - Se use_imagenet_pretrained=True, carrega a arquitetura com pesos do ImageNet.
+        - Se use_imagenet_pretrained=False, carrega apenas a arquitetura (pesos aleatórios).
+    - Em seguida, realiza o fine-tuning se nenhum modelo local foi encontrado.
+    """
     model_filename = f"{model_name}_{dataset_name}_finetuned.pth"
     model_path = MODELS_DIR / model_filename
 
@@ -159,24 +180,52 @@ def load_model(model_name: str, dataset_name: str):
     if num_classes is None:
         raise ValueError(f"Número de classes não definido para '{dataset_name}'.")
 
-    pretrained = not model_path.exists()
-    print(f"Carregando {model_name}. Pré-treinado={pretrained}")
+    model = None
+    
+    # Determina se deve carregar pesos do ImageNet ao criar a arquitetura base
+    # Isso só acontece se não houver um .pth fine-tunado E o usuário quiser usar pré-treinado
+    load_initial_imagenet_weights = use_imagenet_pretrained and not model_path.exists()
+
+    print(f"Carregando arquitetura base para {model_name}.")
+    if load_initial_imagenet_weights:
+        print("  -> Tentando carregar com pesos pré-treinados do ImageNet.")
+    else:
+        print("  -> Carregando arquitetura com pesos aleatórios (ou de .pth existente).")
+
+    weights_arg = 'IMAGENET1K_V1' if load_initial_imagenet_weights else None
 
     if model_name == 'resnet18':
-        model = models.resnet18(weights='IMAGENET1K_V1' if pretrained else None)
+        model = models.resnet18(weights=weights_arg)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
     elif model_name == 'mobilenet_v2':
-        model = models.mobilenet_v2(weights='IMAGENET1K_V1' if pretrained else None)
+        model = models.mobilenet_v2(weights=weights_arg)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+    elif model_name == 'vgg16':
+        model = models.vgg16(weights=weights_arg)
+        # VGG16 tem um classificador mais complexo, substituímos a última camada linear
+        num_ftrs = model.classifier[6].in_features
+        model.classifier[6] = nn.Linear(num_ftrs, num_classes)
+    elif model_name == 'efficientnet_b0': # Exemplo de outro modelo SOTA
+        model = models.efficientnet_b0(weights=weights_arg)
+        num_ftrs = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(num_ftrs, num_classes)
+    # Adicione outros modelos SOTA aqui
+    # elif model_name == 'densenet121':
+    #     model = models.densenet121(weights=weights_arg)
+    #     model.classifier = nn.Linear(model.classifier.in_features, num_classes)
     else:
-        # Adicione outros modelos SOTA aqui se desejar
         raise ValueError(f"Modelo SOTA '{model_name}' não suportado.")
 
+    # Se um modelo fine-tunado localmente existir, carrega-o.
+    # Isso sobrescreverá os pesos (do ImageNet ou aleatórios) da arquitetura base.
     if model_path.exists():
         print(f"Carregando modelo fine-tunado de: {model_path}")
         model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     else:
-        print(f"Modelo fine-tunado não encontrado. Iniciando fine-tuning...")
+        # Se não existe .pth local, realiza o fine-tuning.
+        # O modelo em memória terá pesos do ImageNet (se use_imagenet_pretrained=True) ou aleatórios.
+        print(f"Modelo fine-tunado não encontrado em {model_path}.")
+        print(f"Iniciando fine-tuning a partir de pesos {'ImageNet' if load_initial_imagenet_weights else 'aleatórios'}...")
         model = perform_fine_tuning(model, model_name, dataset_name, model_path)
 
     return model.to(DEVICE)
