@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
+from sklearn.neighbors import NearestNeighbors
 import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import datetime
@@ -395,3 +396,146 @@ def generate_zero_zone_analysis(model, dataset, run_dir: Path, num_images_per_cl
         df_xai.to_csv(run_dir / "zero_zones_xai.csv", index=False)
         
     print(f"Análise Zero Zones concluída. Resultados salvos em: {run_dir}")
+
+# KNN HEATMAP
+
+def generate_knn_heatmap(model, dataset, run_dir: Path,
+                         num_images_per_class: int = 1,
+                         k_neighbors_to_paint: int = 10,
+                         num_key_pixels_to_evaluate: int = 200,
+                         perturb_patch_size: int = 5):
+    """
+    Gera um heatmap KNN para as imagens selecionadas do dataset.
+    Analisa `num_key_pixels_to_evaluate` pixels. Se a perturbação de um pixel chave
+    (e sua vizinhança de `perturb_patch_size`) mudar a classificação,
+    então os `k_neighbors_to_paint` pixels mais próximos (espacialmente)
+    ao pixel chave são destacados no heatmap.
+    Também salva um sumário das imagens analisadas.
+    """
+    
+    model.eval()
+
+    selected_imgs_data = select_correctly_classified_images(model, dataset, num_images_per_class)
+
+
+    if not selected_imgs_data:
+        print("Nenhuma imagem CORRETAMENTE CLASSIFICADA selecionada para análise de heatmap KNN.")
+        return
+
+    knn_heatmaps_dir = run_dir / "knn_heatmaps_generated"
+    knn_heatmaps_dir.mkdir(parents=True, exist_ok=True)
+    
+    base_images_dir = run_dir / "base_images_for_knn"
+    base_images_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_records = [] # Lista para armazenar os dados do sumário
+
+    print(f"Iniciando geração de KNN Heatmaps (k={k_neighbors_to_paint}, pixels_teste={num_key_pixels_to_evaluate})")
+
+    for img_tensor, true_label, original_idx, orig_pred_class in selected_imgs_data:
+        img_tensor_device = img_tensor.clone().to(DEVICE) 
+        _, img_h, img_w = img_tensor_device.shape
+
+        print(f"  Processando imagem ID: {original_idx} (Label: {true_label}, Pred: {orig_pred_class}) Dim: {img_h}x{img_w}")
+
+        try:
+            temp_fig, temp_ax = plt.subplots()
+            img_display_np = img_tensor.cpu().permute(1,2,0).numpy() if img_tensor.shape[0] == 3 else img_tensor.cpu().squeeze(0).numpy()
+            img_display_np = np.clip(img_display_np, 0, 1)
+            temp_ax.imshow(img_display_np, cmap='gray' if img_tensor.shape[0] == 1 else None)
+            temp_ax.set_title(f"Base KNN - ID:{original_idx}\nGT:{true_label} Pred:{orig_pred_class}")
+            temp_ax.axis('off')
+            plt.savefig(base_images_dir / f"knn_base_id{original_idx}.png", bbox_inches='tight')
+            plt.close(temp_fig)
+        except Exception as e:
+            print(f"    Erro ao salvar imagem base ID {original_idx}: {e}")
+
+        all_pixel_coords = np.array([(r, c) for r in range(img_h) for c in range(img_w)])
+        knn_spatial_model = NearestNeighbors(n_neighbors=k_neighbors_to_paint, algorithm='ball_tree')
+        knn_spatial_model.fit(all_pixel_coords)
+
+        num_steps_h = int(np.sqrt(num_key_pixels_to_evaluate * img_h / img_w))
+        num_steps_w = int(np.sqrt(num_key_pixels_to_evaluate * img_w / img_h))
+        if num_steps_h == 0: num_steps_h = 1
+        if num_steps_w == 0: num_steps_w = 1
+        h_indices = np.linspace(0, img_h - 1, num_steps_h, dtype=int)
+        w_indices = np.linspace(0, img_w - 1, num_steps_w, dtype=int)
+        key_pixels_to_test = []
+        for r_idx in h_indices:
+            for c_idx in w_indices:
+                key_pixels_to_test.append((r_idx, c_idx))
+        if not key_pixels_to_test:
+             key_pixels_to_test = [(np.random.randint(img_h), np.random.randint(img_w)) for _ in range(min(10, img_h*img_w))]
+
+        current_image_heatmap = np.zeros((img_h, img_w), dtype=float)
+        impactful_pixels_found_count = 0 # Renomeado para clareza
+
+        for r_key, c_key in key_pixels_to_test:
+            img_perturbed = img_tensor_device.clone()
+            r_start = max(0, r_key - perturb_patch_size // 2)
+            r_end = min(img_h, r_key + (perturb_patch_size // 2) + (perturb_patch_size % 2))
+            c_start = max(0, c_key - perturb_patch_size // 2)
+            c_end = min(img_w, c_key + (perturb_patch_size // 2) + (perturb_patch_size % 2))
+            img_perturbed[:, r_start:r_end, c_start:c_end] = 0.0
+            
+            input_for_pred = _preprocess_for_model(img_perturbed.clone(), model)
+
+
+            with torch.no_grad():
+                output_perturbed = model(input_for_pred.unsqueeze(0))
+                pred_perturbed_class = output_perturbed.argmax(dim=1).item()
+
+            if pred_perturbed_class != orig_pred_class:
+                impactful_pixels_found_count += 1
+                distances, neighbor_indices_1d = knn_spatial_model.kneighbors(np.array([[r_key, c_key]]))
+                for neighbor_1d_idx in neighbor_indices_1d[0]:
+                    neighbor_r, neighbor_c = all_pixel_coords[neighbor_1d_idx]
+                    current_image_heatmap[neighbor_r, neighbor_c] += 1
+
+        print(f"    Imagem ID {original_idx}: {impactful_pixels_found_count}/{len(key_pixels_to_test)} pixels chave causaram mudança na predição.")
+
+        # Adicionar registro ao sumário
+        summary_records.append({
+            'image_id': original_idx,
+            'true_label': true_label,
+            'original_prediction': orig_pred_class,
+            'num_key_pixels_evaluated': len(key_pixels_to_test),
+            'num_impactful_key_pixels': impactful_pixels_found_count,
+            'prediction_changed_by_perturbation': impactful_pixels_found_count > 0
+        })
+
+        if current_image_heatmap.max() > 0:
+            heatmap_normalized = current_image_heatmap / current_image_heatmap.max()
+        else:
+            heatmap_normalized = current_image_heatmap
+
+        display_original_img_np = img_tensor.cpu().permute(1,2,0).numpy() if img_tensor.shape[0]==3 else img_tensor.cpu().squeeze(0).numpy()
+        display_original_img_np = np.clip(display_original_img_np, 0, 1)
+
+        plt.figure(figsize=(8, 8))
+        plt.imshow(display_original_img_np, cmap='gray' if img_tensor.shape[0] == 1 else None, interpolation='nearest')
+        plt.imshow(heatmap_normalized, cmap='jet', alpha=0.6, vmin=0, vmax=1)
+        plt.colorbar(label=f'Impacto KNN (k={k_neighbors_to_paint})')
+        title_str = (f"KNN Heatmap - ID:{original_idx}\n"
+                     f"TrueLabel:{true_label}, OrigPred:{orig_pred_class}\n"
+                     f"Perturb Patch: {perturb_patch_size}x{perturb_patch_size}, Pixels Avaliados: {len(key_pixels_to_test)}")
+        plt.title(title_str, fontsize=10)
+        plt.axis('off')
+        heatmap_save_path = knn_heatmaps_dir / f"knn_heatmap_id{original_idx}_k{k_neighbors_to_paint}.png"
+        plt.savefig(heatmap_save_path, bbox_inches='tight')
+        plt.close()
+        print(f"    -> Heatmap KNN salvo em: {heatmap_save_path}")
+
+    # Salvar o sumário em CSV
+    if summary_records:
+        df_summary = pd.DataFrame(summary_records)
+        summary_csv_path = run_dir / "knn_analysis_summary.csv"
+        try:
+            df_summary.to_csv(summary_csv_path, index=False)
+            print(f"Sumário da análise KNN Heatmap salvo em: {summary_csv_path}")
+        except Exception as e:
+            print(f"Erro ao salvar o sumário CSV da análise KNN: {e}")
+    else:
+        print("Nenhum dado de sumário para salvar para a análise KNN.")
+
+    print(f"Análise de Heatmap KNN concluída. Resultados em: {run_dir}")
