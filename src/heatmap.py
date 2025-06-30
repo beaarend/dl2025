@@ -173,7 +173,7 @@ def parse_coords(coords_str):
         print(f"AVISO: Falha ao parsear coordenadas: '{coords_str}'. Erro: {e}. Retornando 0s.")
         return 0, 0, 0, 0
 
-def generate_heatmap_overlay(records, img_tensor, img_id, run_dir, orig_pred_for_title):
+def generate_heatmap_overlay(records, img_tensor, img_id, run_dir, orig_pred_for_title, show_matrix=False):
     orig_img_h, orig_img_w = img_tensor.shape[1], img_tensor.shape[2]
     heatmap = np.zeros((orig_img_h, orig_img_w), dtype=float)
     changed_zones_count = 0
@@ -187,6 +187,17 @@ def generate_heatmap_overlay(records, img_tensor, img_id, run_dir, orig_pred_for
             r0, r1, c0, c1 = parse_coords(rec['zone_coords'])
             heatmap[r0:min(r1 + 1, orig_img_h), c0:min(c1 + 1, orig_img_w)] += 1
             changed_zones_count += 1
+    
+    if show_matrix:
+        print(f"\n--- Matriz Numérica do Heatmap 'Zero Zones' (ID: {img_id}) ---")
+        print("Valores representam a contagem de vezes que uma zona recursiva causou mudança na predição.")
+        # Para matrizes pequenas (como MNIST 28x28), a impressão é legível.
+        # Para maiores, pode ser truncada pelo NumPy.
+        np.set_printoptions(linewidth=np.inf, threshold=np.inf, precision=0)
+        print(heatmap)
+        np.set_printoptions() 
+        print("--- Fim da Matriz ---\n")            
+
     if heatmap.max() > 0: heatmap_norm = heatmap / heatmap.max()
     else: heatmap_norm = heatmap
     img_display_overlay = img_tensor.squeeze(0).cpu()
@@ -206,36 +217,61 @@ def generate_heatmap_overlay(records, img_tensor, img_id, run_dir, orig_pred_for
     plt.savefig(heatmaps_dir / f"overlay_heatmap_id{img_id}_res{orig_img_h}x{orig_img_w}.png", bbox_inches='tight')
     plt.close()
 
-def generate_zero_zone_analysis(model, dataset, run_dir: Path, num_images_per_class=1, max_level=1000):
+def _compute_zero_zone_matrix(model, img_tensor, orig_pred, idx, label, max_level):
+    """Refatorado: Calcula e retorna a matriz do heatmap para Zero Zones de UMA imagem."""
+    img_h, img_w = img_tensor.shape[1], img_tensor.shape[2]
+    records = []
+    # A função recursiva preenche a lista 'records'
+    # Passamos um run_dir dummy pois não queremos salvar as imagens individuais da recursão aqui.
+    dummy_run_dir = Path("./dummy_zz_temp")
+    recursive_zero_zones(model, img_tensor.to(DEVICE), orig_pred, idx, label, dummy_run_dir, 0, img_w, 0, img_h, level=1, max_level=max_level, records=records)
+
+    heatmap = np.zeros((img_h, img_w), dtype=float)
+    for rec in records:
+        if rec['changed']:
+            r0, r1, c0, c1 = parse_coords(rec['zone_coords'])
+            heatmap[r0:min(r1 + 1, img_h), c0:min(c1 + 1, img_w)] += 1
+    return heatmap
+
+def generate_zero_zone_analysis(model, dataset, run_dir: Path, num_images_per_class=1, max_level=1000, show_matrix=False):
     model.eval()
-    xai_records = []
     selected_imgs = select_correctly_classified_images(model, dataset, num_images_per_class)
     if not selected_imgs:
         print("Nenhuma imagem CORRETA selecionada para análise de Zero Zones.")
         return
-    print(f"\nIniciando análise Zero Zones para {len(selected_imgs)} imagens CORRETAS...")
 
-    # --- MUDANÇA AQUI: Adicionando tqdm ao loop de análise ---
-    for img_tensor, label, idx, orig_pred in tqdm(selected_imgs, desc="Análise Zero Zones", unit="img"):
-        img_tensor = img_tensor.to(DEVICE)
-        img_h, img_w = img_tensor.shape[1], img_tensor.shape[2]
-        # Salvar a imagem base não será monitorado, mas a recursão acontece em seguida
-        current_image_records = []
-        recursive_zero_zones(model, img_tensor, orig_pred, idx, label, run_dir, 0, img_w, 0, img_h, level=1, max_level=max_level, records=current_image_records)
-        xai_records.extend(current_image_records)
-        generate_heatmap_overlay(current_image_records, img_tensor, idx, run_dir, orig_pred)
+    print(f"\nIniciando análise Zero Zones para {len(selected_imgs)} imagens...")
+    
+    # Dicionário para agrupar heatmaps por classe antes de salvar
+    heatmaps_by_class = defaultdict(list)
 
-    if xai_records:
-        df_base = pd.DataFrame([{'datetime': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'analyzed_image_ids': sorted(list(set([r['image_id'] for r in xai_records]))), 'num_analyzed_images': len(set([r['image_id'] for r in xai_records]))}])
-        df_base.to_csv(run_dir / "summary.csv", index=False)
-        df_xai = pd.DataFrame(xai_records)
-        if not df_xai.empty:
-            df_xai['orig_img_resolution'] = df_xai.apply(lambda row: f"{row['img_height']}x{row['img_width']}", axis=1)
-        df_xai = df_xai.sort_values(by=['image_id', 'level', 'zone_name'], ascending=[True, True, True])
-        df_xai.to_csv(run_dir / "zero_zones_xai.csv", index=False)
-    print(f"Análise Zero Zones concluída. Resultados salvos em: {run_dir}")
+    for img_tensor, label, idx, orig_pred in tqdm(selected_imgs, desc="Gerando Heatmaps Zero-Zone", unit="img"):
+        # Gera a matriz do heatmap individual SEM salvar plots intermediários da recursão
+        individual_heatmap = _compute_zero_zone_matrix(model, img_tensor, orig_pred, idx, label, max_level)
+        
+        # Adiciona o heatmap à lista de sua classe
+        heatmaps_by_class[label].append(individual_heatmap)
 
-def generate_knn_heatmap(model, dataset, run_dir: Path, num_images_per_class: int = 1, k_neighbors_to_paint: int = 10, num_key_pixels_to_evaluate: int = 200, perturb_patch_size: int = 5):
+        # A plotagem do heatmap individual (opcional) ainda pode ser feita aqui se desejado
+        # generate_heatmap_overlay(...)
+
+    # --- LÓGICA DE SALVAMENTO .NPY ---
+    npy_output_dir = run_dir / "individual_heatmaps_npy"
+    npy_output_dir.mkdir(exist_ok=True)
+    print(f"\nSalvando heatmaps individuais em arrays .npy em: {npy_output_dir}")
+
+    for label, heatmap_list in heatmaps_by_class.items():
+        # Empilha a lista de matrizes 2D em uma única matriz 3D
+        stacked_heatmaps = np.stack(heatmap_list, axis=0)
+        
+        save_path = npy_output_dir / f"heatmaps_class_{label}.npy"
+        np.save(save_path, stacked_heatmaps)
+        print(f"  -> Classe {label}: Salvo array com shape {stacked_heatmaps.shape} em {save_path.name}")
+    
+    print("\nAnálise Zero Zones (geração de .npy) concluída.")
+
+#precisa atualizar...
+def generate_knn_heatmap(model, dataset, run_dir: Path, num_images_per_class: int = 1, k_neighbors_to_paint: int = 10, num_key_pixels_to_evaluate: int = 200, perturb_patch_size: int = 5, show_matrix: bool = False):
     model.eval()
     selected_imgs_data = select_correctly_classified_images(model, dataset, num_images_per_class)
     if not selected_imgs_data:
@@ -290,6 +326,14 @@ def generate_knn_heatmap(model, dataset, run_dir: Path, num_images_per_class: in
                     neighbor_r, neighbor_c = all_pixel_coords[neighbor_1d_idx]
                     current_image_heatmap[neighbor_r, neighbor_c] += 1
         
+        if show_matrix:
+            print(f"\n--- Matriz Numérica do Heatmap 'KNN' (ID: {original_idx}) ---")
+            print("Valores representam a contagem de 'votos' de pixels vizinhos a um ponto de impacto.")
+            np.set_printoptions(linewidth=np.inf, threshold=np.inf, precision=0)
+            print(current_image_heatmap)
+            np.set_printoptions() 
+            print("--- Fim da Matriz ---\n")
+        
         summary_records.append({'image_id': original_idx, 'true_label': true_label, 'original_prediction': orig_pred_class, 'num_key_pixels_evaluated': len(key_pixels_to_test), 'num_impactful_key_pixels': impactful_pixels_found_count, 'prediction_changed_by_perturbation': impactful_pixels_found_count > 0})
         
         if current_image_heatmap.max() > 0: heatmap_normalized = current_image_heatmap / current_image_heatmap.max()
@@ -322,3 +366,193 @@ def generate_knn_heatmap(model, dataset, run_dir: Path, num_images_per_class: in
     else:
         print("Nenhum dado de sumário para salvar para a análise KNN.")
     print(f"Análise de Heatmap KNN concluída. Resultados em: {run_dir}")
+    
+    
+def aggregate_and_plot_from_npy(npy_input_dir: Path, output_dir: Path):
+    """
+    Lê arquivos .npy contendo heatmaps, agrega-os por classe, e salva os plots finais.
+    Esta é uma função independente para o Passo 2.
+    """
+    print(f"\n--- Iniciando Passo 2: Agregação a partir de arquivos .npy ---")
+    print(f"Lendo arquivos de: {npy_input_dir}")
+    print(f"Salvando plots agregados em: {output_dir}")
+    
+    output_dir.mkdir(exist_ok=True)
+    
+    npy_files = list(npy_input_dir.glob("heatmaps_class_*.npy"))
+    if not npy_files:
+        print(f"AVISO: Nenhum arquivo 'heatmaps_class_*.npy' encontrado em {npy_input_dir}")
+        return
+
+    for file_path in tqdm(npy_files, desc="Processando classes", unit="file"):
+        try:
+            # Extrai o label da classe do nome do arquivo
+            label = int(file_path.stem.split('_')[-1])
+        except (ValueError, IndexError):
+            print(f"AVISO: Não foi possível extrair o label do arquivo {file_path.name}. Pulando.")
+            continue
+
+        # Carrega o array de heatmaps
+        stacked_heatmaps = np.load(file_path)
+        num_aggregated = stacked_heatmaps.shape[0]
+
+        # Calcula o heatmap médio
+        average_heatmap = np.mean(stacked_heatmaps, axis=0)
+
+        # Normaliza para visualização
+        if average_heatmap.max() > 0:
+            viz_heatmap = average_heatmap / average_heatmap.max()
+        else:
+            viz_heatmap = average_heatmap
+
+        print(f"Classe {label}: {num_aggregated} heatmaps agregados. Valor máx. da média: {average_heatmap.max():.2f}")
+
+        # Plota e salva o resultado final
+        plt.figure(figsize=(6, 6))
+        plt.imshow(viz_heatmap, cmap='jet', interpolation='nearest')
+        plt.colorbar(label='Importância Média Normalizada')
+        plt.title(f"Heatmap Agregado - Classe {label}\n({num_aggregated} imagens)")
+        plt.axis('off')
+        
+        img_path = output_dir / f"aggregated_class_{label}.png"
+        plt.savefig(img_path, bbox_inches='tight')
+        plt.close()
+
+    print(f"\nAgregação e plotagem concluídas. Resultados em {output_dir}.")   
+    
+# --- NOVA FUNCIONALIDADE: Ataque de Pixel Guiado por Heatmap ---
+
+def _run_single_pixel_attack(model, image_tensor, true_label, attack_heatmap):
+    """
+    Executa o ataque de perturbação em uma única imagem, zerando pixels
+    em ordem de importância do heatmap até que a predição mude.
+
+    Retorna:
+        - pixels_changed (int): Número de pixels modificados.
+        - final_prediction (int): A nova predição (incorreta).
+        - perturbed_image (Tensor): A imagem com os pixels zerados.
+    """
+    # 1. Obter a ordem dos pixels a serem atacados
+    # Flatten o heatmap e obtenha os índices que o ordenariam em ordem decrescente
+    flat_heatmap = attack_heatmap.flatten()
+    # argsort ordena do menor para o maior, então invertemos com [::-1]
+    sorted_pixel_indices = np.argsort(flat_heatmap)[::-1]
+    
+    # Prepara a imagem para a perturbação
+    perturbed_image = image_tensor.clone()
+    num_total_pixels = image_tensor.shape[1] * image_tensor.shape[2]
+
+    # 2. Iterar e atacar pixel por pixel
+    for i, flat_idx in enumerate(sorted_pixel_indices):
+        pixels_changed = i + 1
+        
+        # Converte o índice flat de volta para coordenadas (linha, coluna)
+        row, col = np.unravel_index(flat_idx, attack_heatmap.shape)
+        
+        # Zera o pixel na imagem (em todos os canais)
+        perturbed_image[:, row, col] = 0.0 # Zerar o pixel
+        
+        # 3. Reavalia o modelo com a imagem perturbada
+        with torch.no_grad():
+            input_for_pred = _preprocess_for_model(perturbed_image.clone(), model)
+            new_pred = model(input_for_pred.to(DEVICE).unsqueeze(0)).argmax().item()
+            
+        # 4. Verifica se o ataque foi bem-sucedido
+        if new_pred != true_label:
+            return pixels_changed, new_pred, perturbed_image
+            
+    # Se o loop terminar, significa que mesmo zerando todos os pixels, a predição não mudou.
+    return num_total_pixels, true_label, perturbed_image
+
+
+def generate_pixel_attack_report(model, dataset, aggregated_heatmaps_dir: Path, run_dir: Path, num_images_per_class: int):
+    """
+    Orquestra o teste de ataque de pixel para várias imagens e gera um relatório.
+    """
+    print("--- Iniciando Análise de Ataque de Pixel Guiado por Heatmap ---")
+    
+    # 1. Carregar os heatmaps agregados
+    aggregated_heatmaps = {}
+    npy_files = list(aggregated_heatmaps_dir.glob("*.npy"))
+    if not npy_files:
+        print(f"ERRO: Nenhum arquivo de heatmap .npy encontrado em '{aggregated_heatmaps_dir}'.")
+        print("Execute primeiro a análise 'aggregate_only'.")
+        return
+        
+    for file_path in npy_files:
+        try:
+            label = int(file_path.stem.split('_')[-1])
+            aggregated_heatmaps[label] = np.load(file_path)
+        except:
+            continue
+    print(f"Carregados {len(aggregated_heatmaps)} heatmaps agregados de {aggregated_heatmaps_dir}.")
+
+    # 2. Selecionar imagens de teste (que o modelo acerta)
+    test_images = select_correctly_classified_images(model, dataset, num_images_per_class)
+    if not test_images:
+        print("Nenhuma imagem corretamente classificada encontrada para atacar.")
+        return
+
+    attack_results = []
+    output_plots_dir = run_dir / "pixel_attack_plots"
+    output_plots_dir.mkdir(exist_ok=True)
+
+    # 3. Executar o ataque para cada imagem de teste
+    for img_tensor, true_label, idx, _ in tqdm(test_images, desc="Executando Ataques"):
+        if true_label not in aggregated_heatmaps:
+            continue
+
+        # Obtém o heatmap agregado para a classe desta imagem
+        # Usamos a média dos heatmaps para o ataque
+        attack_heatmap = np.mean(aggregated_heatmaps[true_label], axis=0)
+
+        # Roda o ataque
+        pixels_changed, final_pred, perturbed_img = _run_single_pixel_attack(model, img_tensor, true_label, attack_heatmap)
+        
+        total_pixels = img_tensor.shape[1] * img_tensor.shape[2]
+        attack_results.append({
+            "image_id": idx,
+            "true_label": true_label,
+            "final_prediction": final_pred,
+            "pixels_changed": pixels_changed,
+            "pixels_changed_percent": (pixels_changed / total_pixels) * 100
+        })
+
+        # 4. Gerar um plot de resultado visual para este ataque
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # Imagem Original
+        axes[0].imshow(img_tensor.cpu().permute(1, 2, 0).squeeze(), cmap='gray')
+        axes[0].set_title(f"Original (ID: {idx})\nPred: {true_label}")
+        axes[0].axis('off')
+        
+        # Máscara de Perturbação
+        mask = (img_tensor - perturbed_img).abs().cpu().permute(1, 2, 0).squeeze()
+        axes[1].imshow(mask, cmap='hot')
+        axes[1].set_title(f"{pixels_changed} Pixels Alterados")
+        axes[1].axis('off')
+
+        # Imagem Atacada
+        axes[2].imshow(perturbed_img.cpu().permute(1, 2, 0).squeeze(), cmap='gray')
+        axes[2].set_title(f"Atacada\nNova Pred: {final_pred}")
+        axes[2].axis('off')
+
+        fig.suptitle(f"Resultado do Ataque - Classe {true_label} -> {final_pred}", fontsize=16)
+        plt.savefig(output_plots_dir / f"attack_id_{idx}_class_{true_label}.png", bbox_inches='tight')
+        plt.close(fig)
+
+    # 5. Apresentar um relatório final no console
+    if attack_results:
+        df_results = pd.DataFrame(attack_results)
+        df_results = df_results.sort_values(by="pixels_changed_percent")
+        
+        print("\n--- Relatório Final do Ataque de Pixel ---")
+        print(df_results.to_string(index=False))
+        
+        # Salva o relatório em CSV
+        df_results.to_csv(run_dir / "pixel_attack_summary.csv", index=False)
+        
+        avg_pixels_changed = df_results["pixels_changed_percent"].mean()
+        print(f"\nResumo: Em média, foi necessário alterar {avg_pixels_changed:.2f}% dos pixels para enganar o modelo.")
+    
+    print(f"Plots dos ataques salvos em: {output_plots_dir}")     
