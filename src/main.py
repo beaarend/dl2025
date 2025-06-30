@@ -18,7 +18,8 @@ def main():
                         help='(Obrigatório para aggregate_only) Diretório contendo os arquivos .npy para agregar.')
 
     # Argumentos que se aplicam a ambos os passos
-    parser.add_argument('--model_name', type=str, help='(Obrigatório para geração) Modelo a ser usado.')
+    parser.add_argument('--model_name', type=str, help='Modelo a ser usado.',
+                    choices=['simple_cnn', 'cifar_cnn', 'resnet18', 'mobilenet_v2', 'squeezenet1_1'])
     parser.add_argument('--dataset_name', type=str, help='(Obrigatório para geração) Dataset a ser usado.')
     parser.add_argument('--save_path', type=str, default='results', help='Caminho base para salvar os resultados.')
     parser.add_argument('--num_images', type=int, default=20, help='Número de imagens (por classe) para analisar.')

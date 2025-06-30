@@ -37,8 +37,10 @@ def _preprocess_for_model(img_tensor, model):
             expected_channels = model.conv1.in_channels
         else: 
              model_type_str = str(type(model)).lower()
-             if 'resnet' in model_type_str or 'mobile' in model_type_str: expected_channels = 3
-             else: expected_channels = 1
+             if 'resnet' in model_type_str or 'mobile' in model_type_str or 'squeeze' in model_type_str:
+                 expected_channels = 3
+             else:
+                 expected_channels = 1
             
         current_channels = input_tensor.shape[0]
 
@@ -48,16 +50,25 @@ def _preprocess_for_model(img_tensor, model):
             input_tensor = input_tensor.mean(dim=0, keepdim=True)
     except Exception as e:
         print(f"AVISO Preprocess (simplificado): Falha ({e}).")
-        if 'SimpleCNN' not in str(type(model)) and input_tensor.shape[0] == 1:
+        # Fallback simples
+        if 'SimpleCNN' not in str(type(model)) and 'CIFAR_CNN' not in str(type(model)) and input_tensor.shape[0] == 1:
             input_tensor = input_tensor.repeat(3, 1, 1)
         expected_channels = input_tensor.shape[0] 
 
-    if expected_channels == 3 and (input_tensor.shape[1:] != (224, 224)):
+    # --- MUDANÇA CRÍTICA AQUI ---
+    # Apenas redimensiona para 224x224 se for um modelo SOTA que espera esse tamanho.
+    # Nossos modelos customizados (SimpleCNN, CIFAR_CNN) não devem ser redimensionados.
+    model_type_str = str(type(model))
+    is_custom_model = 'SimpleCNN' in model_type_str or 'CIFAR_CNN' in model_type_str
+    
+    if not is_custom_model and expected_channels == 3 and (input_tensor.shape[1:] != (224, 224)):
+         print(f"AVISO: Redimensionando imagem de {input_tensor.shape[1:]} para (224, 224) para modelo SOTA.")
          resize_transform = transforms.Compose([transforms.Resize(224), transforms.CenterCrop(224)])
          input_tensor = resize_transform(input_tensor)
-    elif expected_channels == 1 and 'SimpleCNN' in str(type(model)) and (input_tensor.shape[1:] != (28, 28)):
-         if input_tensor.shape[1:] != (28,28):
-             print(f"AVISO: SimpleCNN com input de tamanho {input_tensor.shape[1:]}, esperado 28x28.")
+    elif is_custom_model:
+        # Para nossos modelos customizados, não fazemos nada, pois eles já são flexíveis
+        # e devem receber a imagem no seu tamanho original (28x28 ou 32x32).
+        pass
          
     return input_tensor
 

@@ -13,34 +13,72 @@ MODELS_DIR = Path("models")
 MODELS_DIR.mkdir(exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- NOVA ARQUITETURA: SimpleCNN para Datasets Menores ---
+# --- ARQUITETURA SimpleCNN ATUALIZADA ---
 class SimpleCNN(nn.Module):
-    """Uma CNN simples e leve, otimizada para imagens 28x28 ou 32x32."""
-    def __init__(self, num_classes=10, input_channels=1):
+    """Uma CNN simples e leve, agora flexível para imagens 28x28 ou 32x32."""
+    def __init__(self, num_classes=10, input_channels=1, input_size=28):
         super(SimpleCNN, self).__init__()
-        # Input: (batch, 1, 28, 28)
-        self.conv1 = nn.Sequential(
+        self.conv_layers = nn.Sequential(
+            # Camada 1
             nn.Conv2d(in_channels=input_channels, out_channels=16, kernel_size=5, stride=1, padding=2),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2) # -> (batch, 16, 14, 14)
-        )
-        # Input: (batch, 16, 14, 14)
-        self.conv2 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=2), # 28x28 -> 14x14 | 32x32 -> 16x16
+            
+            # Camada 2
             nn.Conv2d(in_channels=16, out_channels=32, kernel_size=5, stride=1, padding=2),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2) # -> (batch, 32, 7, 7)
+            nn.MaxPool2d(kernel_size=2) # 14x14 -> 7x7 | 16x16 -> 8x8
         )
-        # Camada totalmente conectada
-        # Para 28x28 -> 32 * 7 * 7 = 1568
-        # Para 32x32 -> 32 * 8 * 8 = 2048 (após 2 maxpools)
-        self.fc = nn.Linear(32 * 7 * 7, num_classes)
+        
+        # --- MUDANÇA CRÍTICA AQUI ---
+        # Calcula o tamanho da saída das camadas convolucionais dinamicamente
+        # Após 2 camadas de MaxPool com kernel 2, o tamanho da imagem é dividido por 4.
+        final_conv_size = input_size // 4
+        flattened_features = 32 * final_conv_size * final_conv_size
+        
+        # A camada totalmente conectada agora usa o tamanho calculado
+        self.fc = nn.Linear(flattened_features, num_classes)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
+        x = self.conv_layers(x)
         x = x.view(x.size(0), -1) # Achatamento (flatten)
         output = self.fc(x)
         return output
+
+# --- NOVA ARQUITETURA: CIFAR_CNN ---
+class CIFAR_CNN(nn.Module):
+    """Uma CNN otimizada para datasets 32x32 como o CIFAR-10."""
+    def __init__(self, num_classes=10):
+        super(CIFAR_CNN, self).__init__()
+        self.features = nn.Sequential(
+            # Bloco 1
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2), # 32x32 -> 16x16
+            nn.Dropout(0.25),
+
+            # Bloco 2
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2), # 16x16 -> 8x8
+            nn.Dropout(0.25),
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(64 * 8 * 8, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
 
 # --- Funções Auxiliares ---
 def get_model_input_channels(model: nn.Module) -> int:
@@ -88,12 +126,8 @@ def get_dataset_specific_transforms(dataset_name: str):
         raise ValueError(f"Transformações para o dataset '{dataset_name}' não definidas.")
 
 def load_dataset(dataset_name: str, train: bool, batch_size: int = 64):
-    """Carrega dataset com transformações OTIMIZADAS."""
-    # --- MUDANÇA AQUI ---
     transform = get_dataset_specific_transforms(dataset_name)
-
     print(f"Carregando dataset '{dataset_name}' (Train={train}) com transformações OTIMIZADAS...")
-
     dataset_map = {
         'imagenet': lambda: datasets.ImageNet(root='data/imagenet', split='train' if train else 'val', transform=transform),
         'fashionmnist': lambda: datasets.FashionMNIST(root='data/fashionmnist', train=train, download=True, transform=transform),
@@ -101,10 +135,6 @@ def load_dataset(dataset_name: str, train: bool, batch_size: int = 64):
         'cifar10': lambda: datasets.CIFAR10(root='data/cifar10', train=train, download=True, transform=transform),
         'mnist': lambda: datasets.MNIST(root='data', train=train, download=True, transform=transform)
     }
-    
-    if dataset_name not in dataset_map:
-        raise ValueError(f"Dataset '{dataset_name}' não suportado.")
-    
     dataset = dataset_map[dataset_name]()
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=2, pin_memory=True)
     return dataset, data_loader
@@ -149,7 +179,7 @@ def eval_model(model, loader):
             progress_bar.set_postfix(acc=f"{correct/total:.4f}")
     return correct/total
 
-def perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=5, initial_lr=0.001):
+def perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=30, initial_lr=0.001):
     print(f"--- Iniciando Treino/Fine-Tuning: {model_name} em {dataset_name} ({epochs} epochs) ---")
     model.to(DEVICE)
 
@@ -179,50 +209,64 @@ def perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=5, i
         model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     return model
 
-# --- Carregamento de Modelo (Atualizado para SimpleCNN) ---
+# --- Carregamento de Modelo (Atualizado para incluir CIFAR_CNN) ---
 def load_model(model_name: str, dataset_name: str, use_imagenet_pretrained: bool = True):
     model_filename = f"{model_name}_{dataset_name}_finetuned.pth"
     model_path = MODELS_DIR / model_filename
 
     num_classes_map = {'mnist': 10, 'cifar10': 10, 'fashionmnist': 10, 'cifar100': 100, 'imagenet': 1000}
-    num_classes = num_classes_map[dataset_name]
+    num_classes = num_classes_map.get(dataset_name, 10)
     
-    # Define os canais de entrada com base no dataset
-    input_channels = 1 if dataset_name in ['mnist', 'fashionmnist'] else 3
-
+    if dataset_name in ['mnist', 'fashionmnist']:
+        input_channels, input_size = 1, 28
+    elif dataset_name in ['cifar10', 'cifar100']:
+        input_channels, input_size = 3, 32
+    else:
+        input_channels, input_size = 3, 224
+    
     model = None
     
-    # --- LÓGICA ATUALIZADA ---
     if model_name == 'simple_cnn':
-        print(f"Carregando modelo leve 'SimpleCNN' para '{dataset_name}'.")
-        model = SimpleCNN(num_classes=num_classes, input_channels=input_channels)
+        print(f"Carregando modelo 'SimpleCNN' para '{dataset_name}'.")
+        model = SimpleCNN(num_classes=num_classes, input_channels=input_channels, input_size=input_size)
+    
+    # --- MUDANÇA AQUI: Adicionado suporte para CIFAR_CNN ---
+    elif model_name == 'cifar_cnn':
+        print(f"Carregando modelo 'CIFAR_CNN' otimizado para 32x32.")
+        if input_channels != 3:
+            print("AVISO: CIFAR_CNN é otimizado para 3 canais de entrada (RGB).")
+        model = CIFAR_CNN(num_classes=num_classes)
+    
     else: # Modelos SOTA
         weights_arg = 'IMAGENET1K_V1' if use_imagenet_pretrained and not model_path.exists() else None
         print(f"Carregando arquitetura SOTA '{model_name}'. Pesos pré-treinados: {weights_arg is not None}")
         
         if model_name == 'resnet18':
             model = models.resnet18(weights=weights_arg)
-            # Adapta a primeira camada convolucional se o input não for 3 canais
-            if input_channels != 3:
-                model.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            if input_channels != 3: model.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
             model.fc = nn.Linear(model.fc.in_features, num_classes)
         
         elif model_name == 'mobilenet_v2':
             model = models.mobilenet_v2(weights=weights_arg)
-            if input_channels != 3:
-                model.features[0][0] = nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1, bias=False)
+            if input_channels != 3: model.features[0][0] = nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1, bias=False)
             model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
         
-        # Adicione adaptações para outros modelos SOTA se necessário
+        elif model_name == 'squeezenet1_1':
+            model = models.squeezenet1_1(weights=weights_arg)
+            if input_channels != 3: print("AVISO: SqueezeNet é otimizado para 3 canais de entrada (RGB).")
+            model.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1,1), stride=(1,1))
+            model.num_classes = num_classes
+        
         else:
             raise ValueError(f"Modelo SOTA '{model_name}' não suportado.")
 
-    # Lógica de Carregamento/Treino
     if model_path.exists():
         print(f"Carregando modelo treinado de: {model_path}")
         model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     else:
-        print(f"Modelo treinado não encontrado em {model_path}. Iniciando treino do zero...")
-        model = perform_fine_tuning(model, model_name, dataset_name, model_path)
+        print(f"Modelo treinado não encontrado em {model_path}. Iniciando treino...")
+        # Aumentar épocas para o novo modelo pode ser uma boa ideia
+        epochs = 15 if model_name == 'cifar_cnn' else 5
+        model = perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=epochs)
 
     return model.to(DEVICE)
