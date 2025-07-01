@@ -19,7 +19,7 @@ def main():
 
     # Argumentos que se aplicam a ambos os passos
     parser.add_argument('--model_name', type=str, help='Modelo a ser usado.',
-                    choices=['simple_cnn', 'cifar_cnn', 'resnet18', 'mobilenet_v2', 'squeezenet1_1'])
+                    choices=['simple_cnn', 'cifar_cnn', 'resnet18', 'mobilenet_v2', 'squeezenet1_1', 'better_cnn'])
     parser.add_argument('--dataset_name', type=str, help='(Obrigatório para geração) Dataset a ser usado.')
     parser.add_argument('--save_path', type=str, default='results', help='Caminho base para salvar os resultados.')
     parser.add_argument('--num_images', type=int, default=20, help='Número de imagens (por classe) para analisar.')
@@ -38,7 +38,6 @@ def main():
     print(f"Iniciando Run: {run_dir.name}")
     print(f"Salvando resultados em: {run_dir}")
     
-    # --- LÓGICA DE ROTEAMENTO ATUALIZADA ---
     if args.heatmap_type == 'pixel_attack':
         if not all([args.model_name, args.dataset_name, args.npy_input_dir]):
             parser.error("--model_name, --dataset_name, e --npy_input_dir são obrigatórios para 'pixel_attack'")

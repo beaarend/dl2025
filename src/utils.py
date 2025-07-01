@@ -8,6 +8,8 @@ import time
 import os
 from tqdm import tqdm # Usar tqdm para monitorar o treino
 
+from hg_utils import load_hf_dataset
+
 # --- Configurações Gerais ---
 MODELS_DIR = Path("models")
 MODELS_DIR.mkdir(exist_ok=True)
@@ -44,6 +46,64 @@ class SimpleCNN(nn.Module):
         x = x.view(x.size(0), -1) # Achatamento (flatten)
         output = self.fc(x)
         return output
+
+class BetterCNN(nn.Module):
+    """
+    A more robust CNN designed for 64x64 images like Tiny ImageNet.
+    It includes Batch Normalization and Dropout for better performance and regularization.
+    """
+    def __init__(self, num_classes=200, input_channels=1, input_size=64): # Defaulted to Tiny ImageNet's 200 classes
+        super(BetterCNN, self).__init__()
+        
+        # Feature extractor part (convolutional layers)
+        self.features = nn.Sequential(
+            # --- Block 1 ---
+            # Input: 3 x 64 x 64
+            nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2), # Output: 64 x 32 x 32
+
+            # --- Block 2 ---
+            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2), # Output: 128 x 16 x 16
+
+            # --- Block 3 ---
+            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2), # Output: 256 x 8 x 8
+            
+            # --- Block 4 ---
+            nn.Conv2d(in_channels=256, out_channels=512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2), # Output: 512 x 4 x 4
+        )
+        
+        # Classifier part (fully connected layers)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.5), # Dropout for regularization
+            nn.Linear(512 * 4 * 4, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(1024, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
 
 # --- NOVA ARQUITETURA: CIFAR_CNN ---
 class CIFAR_CNN(nn.Module):
@@ -126,6 +186,10 @@ def get_dataset_specific_transforms(dataset_name: str):
         raise ValueError(f"Transformações para o dataset '{dataset_name}' não definidas.")
 
 def load_dataset(dataset_name: str, train: bool, batch_size: int = 64):
+
+    if dataset_name == 'tiny-imagenet':
+        return load_hf_dataset(dataset_name, train, batch_size)
+
     transform = get_dataset_specific_transforms(dataset_name)
     print(f"Carregando dataset '{dataset_name}' (Train={train}) com transformações OTIMIZADAS...")
     dataset_map = {
@@ -184,6 +248,7 @@ def perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=30, 
     model.to(DEVICE)
 
     ft_batch_size = 64
+
     train_dataset, train_loader = load_dataset(dataset_name, train=True, batch_size=ft_batch_size)
     test_dataset, test_loader = load_dataset(dataset_name, train=False, batch_size=ft_batch_size)
 
@@ -214,13 +279,15 @@ def load_model(model_name: str, dataset_name: str, use_imagenet_pretrained: bool
     model_filename = f"{model_name}_{dataset_name}_finetuned.pth"
     model_path = MODELS_DIR / model_filename
 
-    num_classes_map = {'mnist': 10, 'cifar10': 10, 'fashionmnist': 10, 'cifar100': 100, 'imagenet': 1000}
+    num_classes_map = {'mnist': 10, 'cifar10': 10, 'fashionmnist': 10, 'cifar100': 100, 'imagenet': 1000, 'tiny-imagenet': 200}
     num_classes = num_classes_map.get(dataset_name, 10)
     
     if dataset_name in ['mnist', 'fashionmnist']:
         input_channels, input_size = 1, 28
     elif dataset_name in ['cifar10', 'cifar100']:
         input_channels, input_size = 3, 32
+    elif dataset_name == 'tiny-imagenet':
+        input_channels, input_size = 3, 64
     else:
         input_channels, input_size = 3, 224
     
@@ -230,6 +297,10 @@ def load_model(model_name: str, dataset_name: str, use_imagenet_pretrained: bool
         print(f"Carregando modelo 'SimpleCNN' para '{dataset_name}'.")
         model = SimpleCNN(num_classes=num_classes, input_channels=input_channels, input_size=input_size)
     
+    if model_name == 'better_cnn':
+        print(f"Carregando modelo 'BetterCNN' para '{dataset_name}'.")
+        model = BetterCNN(num_classes=num_classes, input_channels=input_channels, input_size=input_size)
+
     # --- MUDANÇA AQUI: Adicionado suporte para CIFAR_CNN ---
     elif model_name == 'cifar_cnn':
         print(f"Carregando modelo 'CIFAR_CNN' otimizado para 32x32.")
@@ -243,7 +314,13 @@ def load_model(model_name: str, dataset_name: str, use_imagenet_pretrained: bool
         
         if model_name == 'resnet18':
             model = models.resnet18(weights=weights_arg)
-            if input_channels != 3: model.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            if input_size < 100:
+                print(f"Modificando ResNet18 para input de {input_size}x{input_size}...")
+                model.conv1 = nn.Conv2d(input_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
+                model.maxpool = nn.Identity()
+
+            elif input_channels != 3:
+                model.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
             model.fc = nn.Linear(model.fc.in_features, num_classes)
         
         elif model_name == 'mobilenet_v2':
@@ -266,7 +343,9 @@ def load_model(model_name: str, dataset_name: str, use_imagenet_pretrained: bool
     else:
         print(f"Modelo treinado não encontrado em {model_path}. Iniciando treino...")
         # Aumentar épocas para o novo modelo pode ser uma boa ideia
-        epochs = 15 if model_name == 'cifar_cnn' else 5
+        epochs = 15 if model_name == 'cifar_cnn' or 'resnet18' else 5
         model = perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=epochs)
+
+    print(f"Modelo '{model_name}' carregado com sucesso para o dataset '{dataset_name}'.")
 
     return model.to(DEVICE)

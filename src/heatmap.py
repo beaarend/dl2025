@@ -59,9 +59,12 @@ def _preprocess_for_model(img_tensor, model):
     # Apenas redimensiona para 224x224 se for um modelo SOTA que espera esse tamanho.
     # Nossos modelos customizados (SimpleCNN, CIFAR_CNN) não devem ser redimensionados.
     model_type_str = str(type(model))
+    is_modified_resnet = 'resnet' in model_type_str and hasattr(model, 'maxpool') and isinstance(model.maxpool, nn.Identity)
+
+    model_type_str = str(type(model))
     is_custom_model = 'SimpleCNN' in model_type_str or 'CIFAR_CNN' in model_type_str
     
-    if not is_custom_model and expected_channels == 3 and (input_tensor.shape[1:] != (224, 224)):
+    if not is_custom_model and not is_modified_resnet and expected_channels == 3 and (input_tensor.shape[1:] != (224, 224)):
          print(f"AVISO: Redimensionando imagem de {input_tensor.shape[1:]} para (224, 224) para modelo SOTA.")
          resize_transform = transforms.Compose([transforms.Resize(224), transforms.CenterCrop(224)])
          input_tensor = resize_transform(input_tensor)
@@ -82,7 +85,12 @@ def select_correctly_classified_images(model, dataset, num_per_class=1):
     selected = []
     
     try:
-        num_target_classes = len(dataset.classes)
+        if hasattr(dataset, 'features') and 'label' in dataset.features:
+            # For Hugging Face datasets
+            num_target_classes = dataset.features['label'].num_classes
+        else:
+            # For torchvision datasets
+            num_target_classes = len(dataset.classes)
         all_possible_labels = list(range(num_target_classes))
     except AttributeError:
         print("AVISO: Não foi possível determinar o número exato de classes. Assumindo 10.")
@@ -92,11 +100,16 @@ def select_correctly_classified_images(model, dataset, num_per_class=1):
     indices = list(range(len(dataset)))
     random.shuffle(indices)
 
-    # --- MUDANÇA AQUI: Adicionando tqdm ---
     progress_bar = tqdm(indices, desc=f"Buscando {num_per_class} img/classe", unit="img", dynamic_ncols=True)
 
     for idx in progress_bar:
-        img_tensor, label = dataset[idx] 
+        item = dataset[idx]
+        if isinstance(item, dict):
+            img_tensor = item['pixel_values']
+            label = item['label']
+        else:
+            img_tensor, label = item
+
         label_item = label if isinstance(label, int) else label.item()
 
         if counts[label_item] >= num_per_class:
@@ -498,6 +511,12 @@ def generate_pixel_attack_report(model, dataset, aggregated_heatmaps_dir: Path, 
             continue
     print(f"Carregados {len(aggregated_heatmaps)} heatmaps agregados de {aggregated_heatmaps_dir}.")
 
+    class_names = getattr(dataset, 'classes', None)
+    if class_names:
+        print(f"Nomes das classes encontrados: {class_names}")
+    else:
+        print("AVISO: Nomes das classes não encontrados no dataset. Os plots usarão labels numéricos.")
+
     # 2. Selecionar imagens de teste (que o modelo acerta)
     test_images = select_correctly_classified_images(model, dataset, num_images_per_class)
     if not test_images:
@@ -529,12 +548,19 @@ def generate_pixel_attack_report(model, dataset, aggregated_heatmaps_dir: Path, 
             "pixels_changed_percent": (pixels_changed / total_pixels) * 100
         })
 
+        if class_names:
+            true_label_name = class_names[true_label]
+            final_pred_name = class_names[final_pred]
+        else:
+            true_label_name = true_label
+            final_pred_name = final_pred
+
         # 4. Gerar um plot de resultado visual para este ataque
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         
         # Imagem Original
         axes[0].imshow(img_tensor.cpu().permute(1, 2, 0).squeeze(), cmap='gray')
-        axes[0].set_title(f"Original (ID: {idx})\nPred: {true_label}")
+        axes[0].set_title(f"Original (ID: {idx})\nPred: {true_label_name}")
         axes[0].axis('off')
         
         # Máscara de Perturbação
@@ -545,11 +571,11 @@ def generate_pixel_attack_report(model, dataset, aggregated_heatmaps_dir: Path, 
 
         # Imagem Atacada
         axes[2].imshow(perturbed_img.cpu().permute(1, 2, 0).squeeze(), cmap='gray')
-        axes[2].set_title(f"Atacada\nNova Pred: {final_pred}")
+        axes[2].set_title(f"Atacada\nNova Pred: {final_pred_name}")
         axes[2].axis('off')
 
-        fig.suptitle(f"Resultado do Ataque - Classe {true_label} -> {final_pred}", fontsize=16)
-        plt.savefig(output_plots_dir / f"attack_id_{idx}_class_{true_label}.png", bbox_inches='tight')
+        fig.suptitle(f"Resultado do Ataque - Classe {true_label_name} -> {final_pred_name}", fontsize=16)
+        plt.savefig(output_plots_dir / f"attack_id_{idx}_class_{true_label_name}.png", bbox_inches='tight')
         plt.close(fig)
 
     # 5. Apresentar um relatório final no console
