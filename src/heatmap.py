@@ -26,50 +26,23 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def _preprocess_for_model(img_tensor, model):
     """
     Função auxiliar para pré-processar UMA imagem para predição.
+    Esta função é crucial e deve ser consistente.
     """
     input_tensor = img_tensor.clone()
-    expected_channels = -1 
-
-    try:
-        if HAS_UTILS:
-            expected_channels = ut.get_model_input_channels(model)
-        elif hasattr(model, 'conv1'): 
-            expected_channels = model.conv1.in_channels
-        else: 
-             model_type_str = str(type(model)).lower()
-             if 'resnet' in model_type_str or 'mobile' in model_type_str or 'squeeze' in model_type_str:
-                 expected_channels = 3
-             else:
-                 expected_channels = 1
-            
-        current_channels = input_tensor.shape[0]
-
-        if current_channels == 1 and expected_channels == 3:
-            input_tensor = input_tensor.repeat(3, 1, 1)
-        elif current_channels == 3 and expected_channels == 1:
-            input_tensor = input_tensor.mean(dim=0, keepdim=True)
-    except Exception as e:
-        print(f"AVISO Preprocess (simplificado): Falha ({e}).")
-        # Fallback simples
-        if 'SimpleCNN' not in str(type(model)) and 'CIFAR_CNN' not in str(type(model)) and input_tensor.shape[0] == 1:
-            input_tensor = input_tensor.repeat(3, 1, 1)
-        expected_channels = input_tensor.shape[0] 
-
-    # --- MUDANÇA CRÍTICA AQUI ---
-    # Apenas redimensiona para 224x224 se for um modelo SOTA que espera esse tamanho.
-    # Nossos modelos customizados (SimpleCNN, CIFAR_CNN) não devem ser redimensionados.
+    # Assume que para modelos SOTA, a entrada será 3 canais, 224x224
+    # e para modelos custom, será o tamanho nativo.
     model_type_str = str(type(model))
-    is_custom_model = 'SimpleCNN' in model_type_str or 'CIFAR_CNN' in model_type_str
-    
-    if not is_custom_model and expected_channels == 3 and (input_tensor.shape[1:] != (224, 224)):
-         print(f"AVISO: Redimensionando imagem de {input_tensor.shape[1:]} para (224, 224) para modelo SOTA.")
-         resize_transform = transforms.Compose([transforms.Resize(224), transforms.CenterCrop(224)])
-         input_tensor = resize_transform(input_tensor)
-    elif is_custom_model:
-        # Para nossos modelos customizados, não fazemos nada, pois eles já são flexíveis
-        # e devem receber a imagem no seu tamanho original (28x28 ou 32x32).
-        pass
-         
+    is_sota_model = 'resnet' in model_type_str.lower() or 'mobile' in model_type_str.lower() or 'vgg' in model_type_str.lower()
+
+    # Garante 3 canais para modelos SOTA
+    if is_sota_model and input_tensor.shape[0] == 1:
+        input_tensor = input_tensor.repeat(3, 1, 1)
+
+    # Redimensiona para modelos SOTA
+    if is_sota_model and (input_tensor.shape[1:] != (224, 224)):
+        resize_transform = transforms.Compose([transforms.Resize(224), transforms.CenterCrop(224)])
+        input_tensor = resize_transform(input_tensor)
+        
     return input_tensor
 
 def select_correctly_classified_images(model, dataset, num_per_class=1):
@@ -149,6 +122,106 @@ def select_one_per_class(dataset, num_per_class=3):
             counts[label] += 1
         if len(counts) >= 10 and all(c >= num_per_class for c in counts.values()): break
     return selected
+
+def _recursive_scaled_zz(model, low_res_img, orig_pred, idx, label, max_level, records, x0, y0, w, h, level):
+    """Função auxiliar recursiva para o Zero Zones Escalado."""
+    
+    if w < 4 or h < 4 or level > max_level:
+        return
+
+    zone_coords = [
+        (x0, y0, w // 2, h // 2),               # Top-Left
+        (x0 + w // 2, y0, w - w // 2, h // 2),   # Top-Right
+        (x0, y0 + h // 2, w // 2, h - h // 2),   # Bottom-Left
+        (x0 + w // 2, y0 + h // 2, w - w // 2, h - h // 2) # Bottom-Right
+    ]
+
+    for zx, zy, zw, zh in zone_coords:
+        if zw <= 0 or zh <= 0:
+            continue
+
+        # 1. Perturba a imagem de baixa resolução
+        perturbed_low_res = low_res_img.clone()
+        perturbed_low_res[:, zy:zy+zh, zx:zx+zw] = 0.0
+
+        # 2. Pré-processa a imagem perturbada (que inclui o redimensionamento para 224x224)
+        input_for_model = _preprocess_for_model(perturbed_low_res, model)
+
+        # 3. Reavalia o modelo
+        with torch.no_grad():
+            new_pred = model(input_for_model.to(DEVICE).unsqueeze(0)).argmax().item()
+
+        # 4. Registra e, se a predição mudou, continua a recursão
+        changed = (new_pred != orig_pred)
+        records.append({
+            'image_id': idx, 'true_label': label, 'orig_pred': orig_pred,
+            'zone_coords': f"[{zy}..{zy+zh-1}][{zx}..{zx+zw-1}]",
+            'zone_pred': new_pred, 'changed': changed, 'level': level
+        })
+        
+        if changed:
+            _recursive_scaled_zz(model, low_res_img, orig_pred, idx, label, max_level, records, zx, zy, zw, zh, level + 1)
+
+def generate_scaled_zero_zone_analysis(model, dataset, run_dir: Path, num_images_per_class=1, max_level=1000):
+    """
+    Executa a análise "Zero Zones Escalado" e salva os heatmaps brutos
+    em arquivos .npy, agrupados por classe.
+    """
+    model.eval()
+    print(f"\n--- Iniciando Análise Zero Zones Escalado (Max Nível: {max_level}) ---")
+    
+    selected_imgs = select_correctly_classified_images(model, dataset, num_images_per_class)
+    if not selected_imgs:
+        print("Nenhuma imagem CORRETA selecionada para análise.")
+        return
+
+    # Dicionário para agrupar heatmaps por classe antes de salvar
+    heatmaps_by_class = defaultdict(list)
+
+    for img_tensor, label, idx, orig_pred in tqdm(selected_imgs, desc="Gerando Heatmaps ZZ Escalado", unit="img"):
+        
+        img_h, img_w = img_tensor.shape[1], img_tensor.shape[2]
+        records = []
+
+        # Inicia a recursão na imagem de baixa resolução
+        _recursive_scaled_zz(model, img_tensor.to(DEVICE), orig_pred, idx, label, max_level, records,
+                             x0=0, y0=0, w=img_w, h=img_h, level=1)
+        
+        # Gera o heatmap numérico a partir dos records
+        individual_heatmap = np.zeros((img_h, img_w), dtype=np.float32) # Usar float32 é eficiente
+        for rec in records:
+            if rec['changed']:
+                try:
+                    parts = rec['zone_coords'].replace('[', '').split(']')
+                    rows_part, cols_part = parts[0], parts[1]
+                    y0, y1 = map(int, rows_part.split('..'))
+                    x0, x1 = map(int, cols_part.split('..'))
+                    individual_heatmap[y0:y1+1, x0:x1+1] += 1
+                except:
+                    continue 
+
+        # Adiciona o heatmap gerado à lista de sua classe
+        heatmaps_by_class[label].append(individual_heatmap)
+
+    # --- LÓGICA DE SALVAMENTO .NPY ---
+    npy_output_dir = run_dir / "individual_heatmaps_npy"
+    npy_output_dir.mkdir(exist_ok=True)
+    print(f"\nSalvando heatmaps individuais em arrays .npy em: {npy_output_dir}")
+
+    for label, heatmap_list in heatmaps_by_class.items():
+        if not heatmap_list:
+            print(f"  -> Classe {label}: Nenhum heatmap gerado.")
+            continue
+        
+        # Empilha a lista de matrizes 2D em uma única matriz 3D
+        stacked_heatmaps = np.stack(heatmap_list, axis=0)
+        
+        save_path = npy_output_dir / f"heatmaps_class_{label}.npy"
+        np.save(save_path, stacked_heatmaps)
+        print(f"  -> Classe {label}: Salvo array com shape {stacked_heatmaps.shape} em {save_path.name}")
+
+    print("\nAnálise Zero Zones Escalado (geração de .npy) concluída.")
+    print(f"Próximo passo sugerido: executar a análise 'aggregate_only' ou 'pixel_attack' usando o diretório '{npy_output_dir}'")
 
 def recursive_zero_zones(model, img, orig_pred, img_id, label, run_dir, x0, x1, y0, y1, level, max_level, records):
     H_zone_full, W_zone_full = y1 - y0, x1 - x0

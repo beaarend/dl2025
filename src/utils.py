@@ -99,6 +99,17 @@ def get_next_run_dir(base_dir: Path):
     run_dir.mkdir()
     return run_dir
 
+def get_transforms(target_size: int = 224):
+    """Cria transformações padrão para modelos SOTA (ImageNet-like)."""
+    imagenet_normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    return transforms.Compose([
+        transforms.Resize(target_size),
+        transforms.CenterCrop(target_size),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.shape[0] == 1 else x),
+        imagenet_normalize
+    ])
+
 # --- MUDANÇA CRÍTICA: Transformações Específicas por Dataset ---
 def get_dataset_specific_transforms(dataset_name: str):
     """Retorna transformações apropriadas para cada dataset, evitando redimensionamento desnecessário."""
@@ -126,8 +137,10 @@ def get_dataset_specific_transforms(dataset_name: str):
         raise ValueError(f"Transformações para o dataset '{dataset_name}' não definidas.")
 
 def load_dataset(dataset_name: str, train: bool, batch_size: int = 64):
-    transform = get_dataset_specific_transforms(dataset_name)
-    print(f"Carregando dataset '{dataset_name}' (Train={train}) com transformações OTIMIZADAS...")
+    """Carrega dataset de treino OU teste com transformações padrão SOTA."""
+    transform = get_transforms()
+    print(f"Carregando dataset '{dataset_name}' (Train={train}) com transformações padrão SOTA...")
+    
     dataset_map = {
         'imagenet': lambda: datasets.ImageNet(root='data/imagenet', split='train' if train else 'val', transform=transform),
         'fashionmnist': lambda: datasets.FashionMNIST(root='data/fashionmnist', train=train, download=True, transform=transform),
@@ -135,6 +148,10 @@ def load_dataset(dataset_name: str, train: bool, batch_size: int = 64):
         'cifar10': lambda: datasets.CIFAR10(root='data/cifar10', train=train, download=True, transform=transform),
         'mnist': lambda: datasets.MNIST(root='data', train=train, download=True, transform=transform)
     }
+    
+    if dataset_name not in dataset_map:
+        raise ValueError(f"Dataset '{dataset_name}' não suportado.")
+        
     dataset = dataset_map[dataset_name]()
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=2, pin_memory=True)
     return dataset, data_loader
@@ -143,9 +160,7 @@ def load_dataset(dataset_name: str, train: bool, batch_size: int = 64):
 def train_one_epoch(model, loader, optimizer, criterion):
     model.train()
     running_loss, correct, total = 0.0, 0, 0
-    
-    # --- MUDANÇA AQUI: Adicionando tqdm para monitorar o treino ---
-    progress_bar = tqdm(loader, desc="Treinando", unit="batch", leave=False)
+    progress_bar = tqdm(loader, desc="Treinando Cabeça", unit="batch", leave=False)
     for imgs, labels in progress_bar:
         imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
         optimizer.zero_grad()
@@ -158,16 +173,12 @@ def train_one_epoch(model, loader, optimizer, criterion):
         preds = out.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
-        
-        # Atualiza a barra de progresso com a loss e acurácia
         progress_bar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{correct/total:.4f}")
-
     return running_loss / len(loader), correct / total
 
 def eval_model(model, loader):
     model.eval()
     correct, total = 0, 0
-    # --- MUDANÇA AQUI: Adicionando tqdm para monitorar a avaliação ---
     progress_bar = tqdm(loader, desc="Avaliando", unit="batch", leave=False)
     with torch.no_grad():
         for imgs, labels in progress_bar:
@@ -177,96 +188,126 @@ def eval_model(model, loader):
             correct += (preds == labels).sum().item()
             total += labels.size(0)
             progress_bar.set_postfix(acc=f"{correct/total:.4f}")
-    return correct/total
+    return correct / total
 
-def perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=30, initial_lr=0.001):
-    print(f"--- Iniciando Treino/Fine-Tuning: {model_name} em {dataset_name} ({epochs} epochs) ---")
+def perform_head_training(model, model_name, dataset_name, model_path, epochs=15, initial_lr=0.001):
+    """
+    Treina APENAS a cabeça de classificação do modelo (camadas não congeladas).
+    """
+    print(f"--- Iniciando Treinamento de Cabeça: {model_name} em {dataset_name} ({epochs} epochs) ---")
     model.to(DEVICE)
 
-    ft_batch_size = 64
-    train_dataset, train_loader = load_dataset(dataset_name, train=True, batch_size=ft_batch_size)
-    test_dataset, test_loader = load_dataset(dataset_name, train=False, batch_size=ft_batch_size)
+    train_dataset, train_loader = load_dataset(dataset_name, train=True, batch_size=32)
+    test_dataset, test_loader = load_dataset(dataset_name, train=False, batch_size=32)
 
-    optimizer = optim.Adam(model.parameters(), lr=initial_lr) 
+    # --- MUDANÇA CRÍTICA: Otimizar apenas os parâmetros da nova cabeça ---
+    print("Parâmetros a serem treinados (da nova cabeça):")
+    params_to_update = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            params_to_update.append(param)
+            print(f"\t{name}")
+            
+    if not params_to_update:
+        raise ValueError("Nenhum parâmetro para treinar! Verifique se a cabeça foi descongelada corretamente.")
+
+    optimizer = optim.Adam(params_to_update, lr=initial_lr)
     criterion = nn.CrossEntropyLoss()
-    
     best_acc = 0.0
+
     for ep in range(1, epochs + 1):
         print(f"[Época {ep}/{epochs}]")
         loss, acc_tr = train_one_epoch(model, train_loader, optimizer, criterion)
         acc_te = eval_model(model, test_loader)
-        
         print(f"  Fim da Época {ep} -> Loss: {loss:.4f}, Acurácia Treino: {acc_tr:.4f}, Acurácia Teste: {acc_te:.4f}")
-        
+
         if acc_te > best_acc:
             best_acc = acc_te
             print(f"  -> Nova melhor acurácia ({best_acc:.4f})! Salvando modelo em {model_path}...")
             torch.save(model.state_dict(), model_path)
-            
-    print(f"--- Treino Concluído. Melhor Acurácia de Teste: {best_acc:.4f} ---")
+
+    print(f"--- Treinamento de Cabeça Concluído. Melhor Acurácia: {best_acc:.4f} ---")
     
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     return model
 
+def print_trainable_parameters(model):
+    """
+    Imprime o número de parâmetros treináveis e o total de parâmetros no modelo.
+    """
+    trainable_params = 0
+    total_params = 0
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"  -> Parâmetros Treináveis: {trainable_params:,} | "
+        f"Total de Parâmetros: {total_params:,} | "
+        f"Ratio Treinável: {100 * trainable_params / total_params:.2f}%"
+    )
+
 # --- Carregamento de Modelo (Atualizado para incluir CIFAR_CNN) ---
 def load_model(model_name: str, dataset_name: str, use_imagenet_pretrained: bool = True):
-    model_filename = f"{model_name}_{dataset_name}_finetuned.pth"
+    """
+    Carrega um modelo SOTA, congela o backbone e prepara uma nova cabeça para treino.
+    """
+    model_filename = f"{model_name}_{dataset_name}_head_trained.pth" # Nome do arquivo alterado
     model_path = MODELS_DIR / model_filename
 
     num_classes_map = {'mnist': 10, 'cifar10': 10, 'fashionmnist': 10, 'cifar100': 100, 'imagenet': 1000}
-    num_classes = num_classes_map.get(dataset_name, 10)
-    
-    if dataset_name in ['mnist', 'fashionmnist']:
-        input_channels, input_size = 1, 28
-    elif dataset_name in ['cifar10', 'cifar100']:
-        input_channels, input_size = 3, 32
-    else:
-        input_channels, input_size = 3, 224
-    
+    num_classes = num_classes_map.get(dataset_name)
+    if num_classes is None: raise ValueError(f"Número de classes não definido para '{dataset_name}'.")
+
     model = None
+    load_initial_imagenet_weights = use_imagenet_pretrained and not model_path.exists()
+    weights_arg = 'IMAGENET1K_V1' if load_initial_imagenet_weights else None
+
+    print(f"Carregando arquitetura SOTA '{model_name}'. Pesos pré-treinados: {weights_arg is not None}")
     
-    if model_name == 'simple_cnn':
-        print(f"Carregando modelo 'SimpleCNN' para '{dataset_name}'.")
-        model = SimpleCNN(num_classes=num_classes, input_channels=input_channels, input_size=input_size)
-    
-    # --- MUDANÇA AQUI: Adicionado suporte para CIFAR_CNN ---
-    elif model_name == 'cifar_cnn':
-        print(f"Carregando modelo 'CIFAR_CNN' otimizado para 32x32.")
-        if input_channels != 3:
-            print("AVISO: CIFAR_CNN é otimizado para 3 canais de entrada (RGB).")
-        model = CIFAR_CNN(num_classes=num_classes)
-    
-    else: # Modelos SOTA
-        weights_arg = 'IMAGENET1K_V1' if use_imagenet_pretrained and not model_path.exists() else None
-        print(f"Carregando arquitetura SOTA '{model_name}'. Pesos pré-treinados: {weights_arg is not None}")
+    # --- MUDANÇA CRÍTICA: Lógica de carregamento, congelamento e substituição da cabeça ---
+    if model_name == 'resnet18':
+        model = models.resnet18(weights=weights_arg)
+        # Congela todos os parâmetros do backbone
+        for param in model.parameters(): param.requires_grad = False
+        # Substitui a cabeça por uma nova (que terá requires_grad=True por padrão)
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Linear(num_ftrs, num_classes)
         
-        if model_name == 'resnet18':
-            model = models.resnet18(weights=weights_arg)
-            if input_channels != 3: model.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-            model.fc = nn.Linear(model.fc.in_features, num_classes)
+    elif model_name == 'mobilenet_v2':
+        model = models.mobilenet_v2(weights=weights_arg)
+        for param in model.parameters(): param.requires_grad = False
+        num_ftrs = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(num_ftrs, num_classes)
+
+    elif model_name == 'vgg16':
+        model = models.vgg16(weights=weights_arg)
+        for param in model.parameters(): param.requires_grad = False
+        num_ftrs = model.classifier[6].in_features
+        model.classifier[6] = nn.Linear(num_ftrs, num_classes)
         
-        elif model_name == 'mobilenet_v2':
-            model = models.mobilenet_v2(weights=weights_arg)
-            if input_channels != 3: model.features[0][0] = nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1, bias=False)
-            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-        
-        elif model_name == 'squeezenet1_1':
-            model = models.squeezenet1_1(weights=weights_arg)
-            if input_channels != 3: print("AVISO: SqueezeNet é otimizado para 3 canais de entrada (RGB).")
-            model.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1,1), stride=(1,1))
-            model.num_classes = num_classes
-        
-        else:
-            raise ValueError(f"Modelo SOTA '{model_name}' não suportado.")
+    elif model_name == 'squeezenet1_1':
+        model = models.squeezenet1_1(weights=weights_arg)
+        for param in model.parameters(): param.requires_grad = False
+        # SqueezeNet tem uma camada final Conv2d, então a substituímos
+        model.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1,1), stride=(1,1))
+        model.num_classes = num_classes # Atributo necessário para SqueezeNet
+        # Garante que os novos parâmetros da cabeça possam ser treinados
+        for param in model.classifier.parameters(): param.requires_grad = True
+
+    else:
+        raise ValueError(f"Modelo SOTA '{model_name}' não suportado.")
 
     if model_path.exists():
-        print(f"Carregando modelo treinado de: {model_path}")
+        print(f"Carregando modelo com cabeça treinada de: {model_path}")
+        # Carrega o estado completo (backbone congelado + cabeça treinada)
         model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     else:
-        print(f"Modelo treinado não encontrado em {model_path}. Iniciando treino...")
-        # Aumentar épocas para o novo modelo pode ser uma boa ideia
-        epochs = 15 if model_name == 'cifar_cnn' else 5
-        model = perform_fine_tuning(model, model_name, dataset_name, model_path, epochs=epochs)
+        print(f"Modelo com cabeça treinada não encontrado. Iniciando treinamento da cabeça...")
+        model = perform_head_training(model, model_name, dataset_name, model_path)
 
+    print("Contagem de parâmetros do modelo final:")
+    print_trainable_parameters(model)
+    
     return model.to(DEVICE)
