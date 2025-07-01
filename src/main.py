@@ -62,7 +62,7 @@ def main():
             parser.error("--model_name e --dataset_name são obrigatórios para gerar heatmaps.")
             
         model = ut.load_model(args.model_name, args.dataset_name, use_imagenet_pretrained=True)
-        dataset_test, _ = ut.load_dataset(args.dataset_name, train=False)
+        dataset_test, _ = ut.load_dataset(args.dataset_name, train=True)
         
         if args.heatmap_type == 'zero_zone':
             hm.generate_zero_zone_analysis(model, dataset_test, run_dir, 
