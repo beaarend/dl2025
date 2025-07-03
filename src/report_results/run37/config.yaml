@@ -1,0 +1,7 @@
+model_name: gtsrb_cnn
+dataset_name: gtsrb
+save_path: results
+num_images: 1000
+max_level: 1000
+attack_patch_size: 1
+no_pretrained: false

@@ -1,0 +1,13 @@
+model_name: simple_cnn
+heatmap_type: zero_zone
+dataset_name: mnist
+save_path: results
+show_matrix: true
+max_level: 1000
+num_images: 1
+use_pretrained: true
+knn_k: 10
+knn_num_pixels: 100
+knn_patch_size: 10
+device: cpu
+run_dir: results/run2
