@@ -1,0 +1,7 @@
+model_name: simple_cnn
+dataset_name: mnist
+save_path: results
+num_images: 1000
+max_level: 1000
+attack_patch_size: 1
+no_pretrained: false
